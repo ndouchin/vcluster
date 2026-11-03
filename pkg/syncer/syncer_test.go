@@ -278,6 +278,37 @@ func TestController(t *testing.T) {
 func TestReconcile(t *testing.T) {
 	translator := translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
 
+	syncedHostSecret := func(virtualUID types.UID) *corev1.Secret {
+		hostName := translator.HostName(nil, "a", namespaceInVClusterA).Name
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      hostName,
+				Namespace: testingutil.DefaultTestTargetNamespace,
+				Annotations: map[string]string{
+					translate.NameAnnotation:          "a",
+					translate.NamespaceAnnotation:     namespaceInVClusterA,
+					translate.UIDAnnotation:           string(virtualUID),
+					translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("Secret").String(),
+					translate.HostNamespaceAnnotation: testingutil.DefaultTestTargetNamespace,
+					translate.HostNameAnnotation:      hostName,
+				},
+				Labels: map[string]string{
+					translate.MarkerLabel:    translate.VClusterName,
+					translate.NamespaceLabel: namespaceInVClusterA,
+				},
+			},
+		}
+	}
+	virtualSecret := func(uid types.UID) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "a",
+				Namespace: namespaceInVClusterA,
+				UID:       uid,
+			},
+		}
+	}
+
 	type testCase struct {
 		Name  string
 		Focus bool
@@ -286,8 +317,9 @@ func TestReconcile(t *testing.T) {
 
 		EnqueueObjs []types.NamespacedName
 
-		InitialPhysicalState []runtime.Object
-		InitialVirtualState  []runtime.Object
+		InitialPhysicalState   []runtime.Object
+		InitialVirtualState    []runtime.Object
+		InitialVirtualAPIState []runtime.Object
 
 		CreatePhysicalObjects []client.Object
 		CreateVirtualObjects  []client.Object
@@ -535,6 +567,66 @@ func TestReconcile(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name:   "should not delete host object when virtual object exists but is missing from the cache",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState:   []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualAPIState: []runtime.Object{virtualSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
+		{
+			Name:   "should delete host object when virtual object is missing from the cache and the API",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {},
+			},
+		},
+		{
+			Name:   "should not delete host object when only the cached virtual object has a different uid",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState:   []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualState:    []runtime.Object{virtualSecret("old")},
+			InitialVirtualAPIState: []runtime.Object{virtualSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
+		{
+			Name:   "should delete host object when the virtual object uid is different in the cache and the API",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualState:  []runtime.Object{virtualSecret("old")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {},
+			},
+		},
 	}
 	sort.SliceStable(testCases, func(i, j int) bool {
 		// place focused tests first
@@ -560,6 +652,10 @@ func TestReconcile(t *testing.T) {
 		ctx := context.Background()
 		pClient := testingutil.NewFakeClient(scheme.Scheme, tc.InitialPhysicalState...)
 		vClient := testingutil.NewFakeClient(scheme.Scheme, tc.InitialVirtualState...)
+		vAPIReader := client.Reader(vClient)
+		if tc.InitialVirtualAPIState != nil {
+			vAPIReader = testingutil.NewFakeClient(scheme.Scheme, tc.InitialVirtualAPIState...)
+		}
 
 		fakeContext := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
 		syncer, err := tc.Syncer(fakeContext)
@@ -581,8 +677,9 @@ func TestReconcile(t *testing.T) {
 
 			mappings: fakeContext.Mappings,
 
-			virtualClient: vClient,
-			options:       options,
+			virtualClient:    vClient,
+			virtualAPIReader: vAPIReader,
+			options:          options,
 
 			objectCache: synccontext.NewBidirectionalObjectCache(syncer.Resource(), syncer),
 			config:      fakeContext.Config,

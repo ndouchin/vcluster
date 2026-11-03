@@ -60,8 +60,9 @@ func NewSyncController(ctx *synccontext.RegisterContext, syncer syncertypes.Sync
 		currentNamespace:       ctx.CurrentNamespace,
 		currentNamespaceClient: ctx.CurrentNamespaceClient,
 
-		virtualClient: ctx.VirtualManager.GetClient(),
-		options:       options,
+		virtualClient:    ctx.VirtualManager.GetClient(),
+		virtualAPIReader: ctx.VirtualManager.GetAPIReader(),
+		options:          options,
 	}, nil
 }
 
@@ -106,8 +107,9 @@ type SyncController struct {
 	currentNamespace       string
 	currentNamespaceClient client.Client
 
-	virtualClient client.Client
-	options       *syncertypes.Options
+	virtualClient    client.Client
+	virtualAPIReader client.Reader
+	options          *syncertypes.Options
 }
 
 func (r *SyncController) newSyncContext(ctx context.Context, logName string) *synccontext.SyncContext {
@@ -213,6 +215,14 @@ func (r *SyncController) Reconcile(ctx context.Context, vReq reconcile.Request) 
 					return ctrl.Result{RequeueAfter: time.Second}, nil
 				}
 
+				_, liveVObj, err := r.getVirtualObject(syncContext, r.virtualAPIReader, vReq.NamespacedName)
+				if err != nil {
+					return ctrl.Result{}, err
+				} else if liveVObj != nil && string(liveVObj.GetUID()) == pAnnotations[translate.UIDAnnotation] {
+					klog.FromContext(ctx).Info("Requeue because cached virtual object is outdated")
+					return ctrl.Result{RequeueAfter: time.Second}, nil
+				}
+
 				// delete physical object
 				return patcher.DeleteHostObject(syncContext, pObj, vObjOld, "virtual object uid is different")
 			}
@@ -249,6 +259,16 @@ func (r *SyncController) Reconcile(ctx context.Context, vReq reconcile.Request) 
 			}
 		}
 
+		exclude, liveVObj, err := r.getVirtualObject(syncContext, r.virtualAPIReader, vReq.NamespacedName)
+		if err != nil {
+			return ctrl.Result{}, err
+		} else if exclude {
+			return ctrl.Result{}, nil
+		} else if liveVObj != nil {
+			klog.FromContext(ctx).Info("Requeue because virtual object is not in the cache yet")
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+
 		result, err := r.genericSyncer.SyncToVirtual(syncContext, &synccontext.SyncToVirtualEvent[client.Object]{
 			VirtualOld: vObjOld,
 
@@ -266,7 +286,7 @@ func (r *SyncController) Reconcile(ctx context.Context, vReq reconcile.Request) 
 
 func (r *SyncController) getObjects(ctx *synccontext.SyncContext, vReq, pReq ctrl.Request) (vObjOld, vObj, pObjOld, pObj client.Object, err error) {
 	// get virtual object
-	exclude, vObj, err := r.getVirtualObject(ctx, vReq.NamespacedName)
+	exclude, vObj, err := r.getVirtualObject(ctx, r.virtualClient, vReq.NamespacedName)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	} else if exclude {
@@ -317,7 +337,10 @@ func (r *SyncController) getObjects(ctx *synccontext.SyncContext, vReq, pReq ctr
 	return vObjOld, vObj, pObjOld, pObj, nil
 }
 
-func (r *SyncController) getVirtualObject(ctx context.Context, req types.NamespacedName) (bool, client.Object, error) {
+// getVirtualObject reads through the given reader. Decisions that can delete a host object use the
+// uncached API reader, because the virtual cache can lag behind the host cache, for example on a
+// replica that resumes after it lost the leader election.
+func (r *SyncController) getVirtualObject(ctx context.Context, reader client.Reader, req types.NamespacedName) (bool, client.Object, error) {
 	// we don't have an object to retrieve
 	if req.Name == "" {
 		return true, nil, nil
@@ -325,7 +348,7 @@ func (r *SyncController) getVirtualObject(ctx context.Context, req types.Namespa
 
 	// get virtual resource
 	vObj := r.syncer.Resource()
-	err := r.virtualClient.Get(ctx, req, vObj)
+	err := reader.Get(ctx, req, vObj)
 	if err != nil {
 		if !kerrors.IsNotFound(err) {
 			return false, nil, fmt.Errorf("get virtual object: %w", err)
