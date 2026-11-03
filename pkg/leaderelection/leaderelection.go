@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
@@ -21,6 +22,30 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 )
+
+var (
+	elector           atomic.Pointer[leaderelection.LeaderElector]
+	reportedLeaseLoss atomic.Bool
+)
+
+// HoldsLease reports whether this replica can trust that it still holds the leader lease. client-go
+// doesn't fence a former leader: a replica that stalls for longer than the lease duration resumes and
+// keeps reconciling until its renew deadline passes, while another replica may already lead. Without
+// leader election (a single replica) it always returns true.
+func HoldsLease() bool {
+	if holdsLease(elector.Load()) {
+		return true
+	}
+
+	if reportedLeaseLoss.CompareAndSwap(false, true) {
+		klog.Info("Stop reconciling, because the leader lease could not be confirmed")
+	}
+	return false
+}
+
+func holdsLease(le *leaderelection.LeaderElector) bool {
+	return le == nil || (le.IsLeader() && le.Check(0) == nil)
+}
 
 func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Scheme, run func() error) error {
 	localConfig := ctx.HostManager.GetConfig()
@@ -64,7 +89,7 @@ func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Sch
 	}
 
 	// try and become the leader and start controller manager loops
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+	le, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
 		Lock:          rl,
 		LeaseDuration: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.LeaseDuration) * time.Second,
 		RenewDeadline: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.RenewDeadline) * time.Second,
@@ -91,6 +116,12 @@ func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Sch
 			},
 		},
 	})
+	if err != nil {
+		return errors.Wrap(err, "create leader elector")
+	}
+
+	elector.Store(le)
+	le.Run(ctx)
 
 	return nil
 }

@@ -321,6 +321,8 @@ func TestReconcile(t *testing.T) {
 		InitialVirtualState    []runtime.Object
 		InitialVirtualAPIState []runtime.Object
 
+		LeaseLost bool
+
 		CreatePhysicalObjects []client.Object
 		CreateVirtualObjects  []client.Object
 
@@ -627,6 +629,21 @@ func TestReconcile(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("Secret"): {},
 			},
 		},
+		{
+			Name:   "should not delete host object when the leader lease could not be confirmed",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			LeaseLost:            true,
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
 	}
 	sort.SliceStable(testCases, func(i, j int) bool {
 		// place focused tests first
@@ -680,6 +697,8 @@ func TestReconcile(t *testing.T) {
 			virtualClient:    vClient,
 			virtualAPIReader: vAPIReader,
 			options:          options,
+
+			holdsLease: func() bool { return !tc.LeaseLost },
 
 			objectCache: synccontext.NewBidirectionalObjectCache(syncer.Resource(), syncer),
 			config:      fakeContext.Config,

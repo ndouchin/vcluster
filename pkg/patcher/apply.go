@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/loft-sh/vcluster/pkg/leaderelection"
 	"github.com/loft-sh/vcluster/pkg/scheme"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/clienthelper"
@@ -135,6 +136,10 @@ func deleteObject(ctx *synccontext.SyncContext, obj client.Object, reason string
 	accessor, err := meta.Accessor(obj)
 	if err != nil {
 		return err
+	}
+
+	if !leaderelection.HoldsLease() {
+		return fmt.Errorf("refuse to delete %s object %s/%s, because the leader lease could not be confirmed", side, accessor.GetNamespace(), accessor.GetName())
 	}
 
 	if obj.GetNamespace() != "" {

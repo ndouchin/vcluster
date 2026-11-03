@@ -10,6 +10,7 @@ import (
 
 	"github.com/loft-sh/vcluster/pkg/config"
 	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/leaderelection"
 	"github.com/loft-sh/vcluster/pkg/patcher"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
@@ -63,6 +64,8 @@ func NewSyncController(ctx *synccontext.RegisterContext, syncer syncertypes.Sync
 		virtualClient:    ctx.VirtualManager.GetClient(),
 		virtualAPIReader: ctx.VirtualManager.GetAPIReader(),
 		options:          options,
+
+		holdsLease: leaderelection.HoldsLease,
 	}, nil
 }
 
@@ -110,6 +113,8 @@ type SyncController struct {
 	virtualClient    client.Client
 	virtualAPIReader client.Reader
 	options          *syncertypes.Options
+
+	holdsLease func() bool
 }
 
 func (r *SyncController) newSyncContext(ctx context.Context, logName string) *synccontext.SyncContext {
@@ -134,6 +139,10 @@ func (r *SyncController) Reconcile(ctx context.Context, vReq reconcile.Request) 
 			retErr = nil
 		}
 	}()
+
+	if !r.holdsLease() {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
 
 	// extract request
 	pReq, ok := r.getHostRequest(vReq)
