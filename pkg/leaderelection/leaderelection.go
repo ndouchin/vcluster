@@ -34,6 +34,9 @@ var (
 // leader election (a single replica) it always returns true.
 func HoldsLease() bool {
 	if holdsLease(elector.Load()) {
+		if reportedLeaseLoss.CompareAndSwap(true, false) {
+			klog.Info("Resume reconciling, because the leader lease is confirmed again")
+		}
 		return true
 	}
 
