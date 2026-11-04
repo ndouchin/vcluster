@@ -55,6 +55,7 @@ func TestHoldsLease(t *testing.T) {
 		cancel()
 		<-stopped
 	}()
+	defer close(release)
 
 	select {
 	case <-leading:
@@ -68,5 +69,4 @@ func TestHoldsLease(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 	assert.Assert(t, le.IsLeader(), "client-go still reports the stalled replica as leader")
 	assert.Assert(t, !holdsLease(le), "a leader whose last renewal is older than the lease duration must not trust its lease")
-	close(release)
 }
