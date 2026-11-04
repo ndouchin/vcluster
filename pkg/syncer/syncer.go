@@ -269,14 +269,18 @@ func (r *SyncController) Reconcile(ctx context.Context, vReq reconcile.Request) 
 			}
 		}
 
-		exclude, liveVObj, err := r.getVirtualObject(syncContext, r.virtualAPIReader, vReq.NamespacedName)
-		if err != nil {
-			return ctrl.Result{}, err
-		} else if exclude {
-			return ctrl.Result{}, nil
-		} else if liveVObj != nil {
-			klog.FromContext(ctx).Info("Requeue because virtual object is not in the cache yet")
-			return ctrl.Result{RequeueAfter: time.Second}, nil
+		// host objects that weren't synced from a virtual object, such as mirrored nodes, would cost a
+		// virtual API call on every update
+		if pObj.GetAnnotations()[translate.NameAnnotation] != "" {
+			exclude, liveVObj, err := r.getVirtualObject(syncContext, r.virtualAPIReader, vReq.NamespacedName)
+			if err != nil {
+				return ctrl.Result{}, err
+			} else if exclude {
+				return ctrl.Result{}, nil
+			} else if liveVObj != nil {
+				klog.FromContext(ctx).Info("Requeue because virtual object is not in the cache yet")
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 		}
 
 		result, err := r.genericSyncer.SyncToVirtual(syncContext, &synccontext.SyncToVirtualEvent[client.Object]{
