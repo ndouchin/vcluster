@@ -299,6 +299,12 @@ func TestReconcile(t *testing.T) {
 			},
 		}
 	}
+	leaseLostAfterCalls := func(calls int) func() bool {
+		return func() bool {
+			calls--
+			return calls >= 0
+		}
+	}
 	virtualSecret := func(uid types.UID) *corev1.Secret {
 		return &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -321,7 +327,7 @@ func TestReconcile(t *testing.T) {
 		InitialVirtualState    []runtime.Object
 		InitialVirtualAPIState []runtime.Object
 
-		LeaseLost bool
+		HoldsLease func() bool
 
 		CreatePhysicalObjects []client.Object
 		CreateVirtualObjects  []client.Object
@@ -638,11 +644,29 @@ func TestReconcile(t *testing.T) {
 			},
 
 			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
-			LeaseLost:            true,
+			HoldsLease:           leaseLostAfterCalls(0),
 
 			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
 				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
 			},
+		},
+		{
+			Name:   "should not delete host object when the leader lease is lost during the reconcile",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			HoldsLease:           leaseLostAfterCalls(1),
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+
+			shouldErr: true,
+			errMsg:    "leader lease could not be confirmed",
 		},
 	}
 	sort.SliceStable(testCases, func(i, j int) bool {
@@ -674,6 +698,11 @@ func TestReconcile(t *testing.T) {
 			vAPIReader = testingutil.NewFakeClient(scheme.Scheme, tc.InitialVirtualAPIState...)
 		}
 
+		holdsLease := tc.HoldsLease
+		if holdsLease == nil {
+			holdsLease = func() bool { return true }
+		}
+
 		fakeContext := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
 		syncer, err := tc.Syncer(fakeContext)
 		assert.NilError(t, err)
@@ -698,7 +727,7 @@ func TestReconcile(t *testing.T) {
 			virtualAPIReader: vAPIReader,
 			options:          options,
 
-			holdsLease: func() bool { return !tc.LeaseLost },
+			holdsLease: holdsLease,
 
 			objectCache: synccontext.NewBidirectionalObjectCache(syncer.Resource(), syncer),
 			config:      fakeContext.Config,
