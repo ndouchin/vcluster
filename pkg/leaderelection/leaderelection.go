@@ -37,8 +37,9 @@ type leaderState struct {
 // HoldsLease reports whether this replica can trust that it still holds the leader lease: it is the
 // observed holder and its last successful renewal started less than the renew deadline ago. client-go
 // doesn't fence a former leader: a replica that stalls for longer than the lease duration resumes and
-// keeps reconciling until its renew deadline passes, while another replica may already lead. Without
-// leader election (a single replica) it always returns true.
+// keeps reconciling until its renew deadline passes, while another replica may already lead. It also
+// turns false when renewals keep failing, up to one retry period before client-go gives the lease up.
+// Without leader election (a single replica) it always returns true.
 func HoldsLease() bool {
 	if holdsLease(leader.Load()) {
 		if reportedLeaseLoss.CompareAndSwap(true, false) {
