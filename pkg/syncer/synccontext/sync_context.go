@@ -25,6 +25,8 @@ type SyncContext struct {
 
 	CurrentNamespace       string
 	CurrentNamespaceClient client.Client
+
+	HoldsLease func() bool
 }
 
 func (s *SyncContext) Close() error {

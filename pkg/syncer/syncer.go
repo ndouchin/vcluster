@@ -128,6 +128,7 @@ func (r *SyncController) newSyncContext(ctx context.Context, logName string) *sy
 		CurrentNamespaceClient: r.currentNamespaceClient,
 		VirtualClient:          r.virtualClient,
 		Mappings:               r.mappings,
+		HoldsLease:             r.holdsLease,
 	}
 	return syncCtx
 }

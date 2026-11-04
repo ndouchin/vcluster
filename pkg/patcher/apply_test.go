@@ -1,12 +1,18 @@
 package patcher
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/loghelper"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestSanitizePatchForLog(t *testing.T) {
@@ -212,5 +218,40 @@ func wantFieldValues(field string, want map[string]string) func(t *testing.T, go
 				t.Fatalf("[%q][%q] = %q, want %q", field, k, gotVal, wantVal)
 			}
 		}
+	}
+}
+
+func TestDeleteHostObjectRequiresLease(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		holdsLease  func() bool
+		wantDeleted bool
+	}{
+		{name: "without a lease check", holdsLease: nil, wantDeleted: true},
+		{name: "with the lease held", holdsLease: func() bool { return true }, wantDeleted: true},
+		{name: "with the lease lost", holdsLease: func() bool { return false }, wantDeleted: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pObj := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: "host"}}
+			hostClient := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(pObj.DeepCopy()).Build()
+			ctx := &synccontext.SyncContext{
+				Context:    context.Background(),
+				Log:        loghelper.New("test"),
+				HostClient: hostClient,
+				HoldsLease: tc.holdsLease,
+			}
+
+			_, err := DeleteHostObject(ctx, pObj, nil, "test")
+			if tc.wantDeleted && err != nil {
+				t.Fatalf("delete: %v", err)
+			} else if !tc.wantDeleted && err == nil {
+				t.Fatal("delete succeeded without the lease")
+			}
+
+			err = hostClient.Get(ctx, client.ObjectKeyFromObject(pObj), &corev1.ConfigMap{})
+			if deleted := kerrors.IsNotFound(err); deleted != tc.wantDeleted {
+				t.Fatalf("host object deleted = %v, want %v (get error: %v)", deleted, tc.wantDeleted, err)
+			}
+		})
 	}
 }
