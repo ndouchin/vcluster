@@ -66,10 +66,10 @@ func (r *fakeSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Context:                ctx,
 		Log:                    log,
 		Config:                 r.config,
-		HostClient:             r.physicalClient,
+		HostClient:             fenceDeletes(r.physicalClient, r.holdsLease),
 		CurrentNamespace:       r.currentNamespace,
-		CurrentNamespaceClient: r.currentNamespaceClient,
-		VirtualClient:          r.virtualClient,
+		CurrentNamespaceClient: fenceDeletes(r.currentNamespaceClient, r.holdsLease),
+		VirtualClient:          fenceDeletes(r.virtualClient, r.holdsLease),
 		Mappings:               r.mappings,
 		HoldsLease:             r.holdsLease,
 	}

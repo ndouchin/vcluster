@@ -11,6 +11,7 @@ import (
 	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
 	"gotest.tools/v3/assert"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -53,4 +54,31 @@ func TestFakeSyncerRequiresLease(t *testing.T) {
 			assert.Equal(t, result.RequeueAfter, time.Second)
 		}
 	}
+}
+
+type deletingFakeSyncer struct {
+	countingFakeSyncer
+}
+
+func (s *deletingFakeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
+	return ctrl.Result{}, ctx.VirtualClient.Delete(ctx, vObj)
+}
+
+func TestFakeSyncerFencesDeletes(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}}
+	virtualClient := testingutil.NewFakeClient(scheme.Scheme, node.DeepCopy())
+	leaseChecks := 0
+	controller := &fakeSyncer{
+		syncer:        &deletingFakeSyncer{},
+		log:           loghelper.New("test"),
+		virtualClient: virtualClient,
+		holdsLease: func() bool {
+			leaseChecks++
+			return leaseChecks == 1
+		},
+	}
+
+	_, err := controller.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: node.Name}})
+	assert.ErrorContains(t, err, "leader lease could not be confirmed")
+	assert.NilError(t, virtualClient.Get(context.Background(), client.ObjectKeyFromObject(node), &corev1.Node{}), "the node must survive a delete without the lease")
 }

@@ -95,6 +95,29 @@ func (s *mockSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccont
 
 var _ syncertypes.Syncer = &mockSyncer{}
 
+// directDeleteMockSyncer deletes through the sync context's host client instead of the patcher, as many
+// resource syncers do
+type directDeleteMockSyncer struct {
+	*mockSyncer
+}
+
+func NewDirectDeleteMockSyncer(ctx *synccontext.RegisterContext) (syncertypes.Syncer, error) {
+	syncer, err := NewMockSyncer(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &directDeleteMockSyncer{mockSyncer: syncer.(*mockSyncer)}, nil
+}
+
+func (s *directDeleteMockSyncer) Syncer() syncertypes.Sync[client.Object] {
+	return ToGenericSyncer[*corev1.Secret](s)
+}
+
+func (s *directDeleteMockSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.Secret]) (ctrl.Result, error) {
+	return ctrl.Result{}, ctx.HostClient.Delete(ctx, event.Host)
+}
+
 var (
 	namespaceInVClusterA = "default"
 )
@@ -653,6 +676,24 @@ func TestReconcile(t *testing.T) {
 		{
 			Name:   "should not delete host object when the leader lease is lost during the reconcile",
 			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			HoldsLease:           leaseLostAfterCalls(1),
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+
+			shouldErr: true,
+			errMsg:    "leader lease could not be confirmed",
+		},
+		{
+			Name:   "should not delete host object through the host client when the leader lease is lost during the reconcile",
+			Syncer: NewDirectDeleteMockSyncer,
 
 			EnqueueObjs: []types.NamespacedName{
 				{Name: "a", Namespace: namespaceInVClusterA},
