@@ -2,9 +2,11 @@ package syncer
 
 import (
 	"context"
+	"time"
 
 	"github.com/loft-sh/vcluster/pkg/config"
 	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/leaderelection"
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
 	"github.com/loft-sh/vcluster/pkg/util/loghelper"
@@ -29,6 +31,8 @@ func RegisterFakeSyncer(ctx *synccontext.RegisterContext, syncer syncertypes.Fak
 		config: ctx.Config,
 
 		virtualClient: ctx.VirtualManager.GetClient(),
+
+		holdsLease: leaderelection.HoldsLease,
 	}
 
 	return controller.Register(ctx)
@@ -48,9 +52,15 @@ type fakeSyncer struct {
 	config *config.VirtualClusterConfig
 
 	virtualClient client.Client
+
+	holdsLease func() bool
 }
 
 func (r *fakeSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	if !r.holdsLease() {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
 	log := loghelper.NewFromExisting(r.log.Base(), req.Name)
 	syncContext := &synccontext.SyncContext{
 		Context:                ctx,
@@ -61,6 +71,7 @@ func (r *fakeSyncer) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		CurrentNamespaceClient: r.currentNamespaceClient,
 		VirtualClient:          r.virtualClient,
 		Mappings:               r.mappings,
+		HoldsLease:             r.holdsLease,
 	}
 
 	// check if we should skip reconcile
