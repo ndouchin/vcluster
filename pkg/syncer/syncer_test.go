@@ -95,6 +95,29 @@ func (s *mockSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccont
 
 var _ syncertypes.Syncer = &mockSyncer{}
 
+// directDeleteMockSyncer deletes through the sync context's host client instead of the patcher, as many
+// resource syncers do
+type directDeleteMockSyncer struct {
+	*mockSyncer
+}
+
+func NewDirectDeleteMockSyncer(ctx *synccontext.RegisterContext) (syncertypes.Syncer, error) {
+	syncer, err := NewMockSyncer(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &directDeleteMockSyncer{mockSyncer: syncer.(*mockSyncer)}, nil
+}
+
+func (s *directDeleteMockSyncer) Syncer() syncertypes.Sync[client.Object] {
+	return ToGenericSyncer[*corev1.Secret](s)
+}
+
+func (s *directDeleteMockSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.Secret]) (ctrl.Result, error) {
+	return ctrl.Result{}, ctx.HostClient.Delete(ctx, event.Host)
+}
+
 var (
 	namespaceInVClusterA = "default"
 )
@@ -278,6 +301,43 @@ func TestController(t *testing.T) {
 func TestReconcile(t *testing.T) {
 	translator := translate.NewSingleNamespaceTranslator(testingutil.DefaultTestTargetNamespace)
 
+	syncedHostSecret := func(virtualUID types.UID) *corev1.Secret {
+		hostName := translator.HostName(nil, "a", namespaceInVClusterA).Name
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      hostName,
+				Namespace: testingutil.DefaultTestTargetNamespace,
+				Annotations: map[string]string{
+					translate.NameAnnotation:          "a",
+					translate.NamespaceAnnotation:     namespaceInVClusterA,
+					translate.UIDAnnotation:           string(virtualUID),
+					translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("Secret").String(),
+					translate.HostNamespaceAnnotation: testingutil.DefaultTestTargetNamespace,
+					translate.HostNameAnnotation:      hostName,
+				},
+				Labels: map[string]string{
+					translate.MarkerLabel:    translate.VClusterName,
+					translate.NamespaceLabel: namespaceInVClusterA,
+				},
+			},
+		}
+	}
+	leaseLostAfterCalls := func(calls int) func() bool {
+		return func() bool {
+			calls--
+			return calls >= 0
+		}
+	}
+	virtualSecret := func(uid types.UID) *corev1.Secret {
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "a",
+				Namespace: namespaceInVClusterA,
+				UID:       uid,
+			},
+		}
+	}
+
 	type testCase struct {
 		Name  string
 		Focus bool
@@ -286,8 +346,11 @@ func TestReconcile(t *testing.T) {
 
 		EnqueueObjs []types.NamespacedName
 
-		InitialPhysicalState []runtime.Object
-		InitialVirtualState  []runtime.Object
+		InitialPhysicalState   []runtime.Object
+		InitialVirtualState    []runtime.Object
+		InitialVirtualAPIState []runtime.Object
+
+		HoldsLease func() bool
 
 		CreatePhysicalObjects []client.Object
 		CreateVirtualObjects  []client.Object
@@ -535,6 +598,117 @@ func TestReconcile(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name:   "should not delete host object when virtual object exists but is missing from the cache",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState:   []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualAPIState: []runtime.Object{virtualSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
+		{
+			Name:   "should delete host object when virtual object is missing from the cache and the API",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {},
+			},
+		},
+		{
+			Name:   "should not delete host object when only the cached virtual object has a different uid",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState:   []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualState:    []runtime.Object{virtualSecret("old")},
+			InitialVirtualAPIState: []runtime.Object{virtualSecret("123")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
+		{
+			Name:   "should delete host object when the virtual object uid is different in the cache and the API",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			InitialVirtualState:  []runtime.Object{virtualSecret("old")},
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {},
+			},
+		},
+		{
+			Name:   "should not delete host object when the leader lease could not be confirmed",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			HoldsLease:           leaseLostAfterCalls(0),
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+		},
+		{
+			Name:   "should not delete host object when the leader lease is lost during the reconcile",
+			Syncer: NewMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			HoldsLease:           leaseLostAfterCalls(1),
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+
+			shouldErr: true,
+			errMsg:    "leader lease could not be confirmed",
+		},
+		{
+			Name:   "should not delete host object through the host client when the leader lease is lost during the reconcile",
+			Syncer: NewDirectDeleteMockSyncer,
+
+			EnqueueObjs: []types.NamespacedName{
+				{Name: "a", Namespace: namespaceInVClusterA},
+			},
+
+			InitialPhysicalState: []runtime.Object{syncedHostSecret("123")},
+			HoldsLease:           leaseLostAfterCalls(1),
+
+			ExpectedPhysicalState: map[schema.GroupVersionKind][]runtime.Object{
+				corev1.SchemeGroupVersion.WithKind("Secret"): {syncedHostSecret("123")},
+			},
+
+			shouldErr: true,
+			errMsg:    "leader lease could not be confirmed",
+		},
 	}
 	sort.SliceStable(testCases, func(i, j int) bool {
 		// place focused tests first
@@ -560,6 +734,15 @@ func TestReconcile(t *testing.T) {
 		ctx := context.Background()
 		pClient := testingutil.NewFakeClient(scheme.Scheme, tc.InitialPhysicalState...)
 		vClient := testingutil.NewFakeClient(scheme.Scheme, tc.InitialVirtualState...)
+		vAPIReader := client.Reader(vClient)
+		if tc.InitialVirtualAPIState != nil {
+			vAPIReader = testingutil.NewFakeClient(scheme.Scheme, tc.InitialVirtualAPIState...)
+		}
+
+		holdsLease := tc.HoldsLease
+		if holdsLease == nil {
+			holdsLease = func() bool { return true }
+		}
 
 		fakeContext := syncertesting.NewFakeRegisterContext(testingutil.NewFakeConfig(), pClient, vClient)
 		syncer, err := tc.Syncer(fakeContext)
@@ -581,8 +764,11 @@ func TestReconcile(t *testing.T) {
 
 			mappings: fakeContext.Mappings,
 
-			virtualClient: vClient,
-			options:       options,
+			virtualClient:    vClient,
+			virtualAPIReader: vAPIReader,
+			options:          options,
+
+			holdsLease: holdsLease,
 
 			objectCache: synccontext.NewBidirectionalObjectCache(syncer.Resource(), syncer),
 			config:      fakeContext.Config,

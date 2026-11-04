@@ -25,6 +25,11 @@ type SyncContext struct {
 
 	CurrentNamespace       string
 	CurrentNamespaceClient client.Client
+
+	// HoldsLease is checked by the patcher before it deletes an object, and nil allows the delete. The sync
+	// controller sets it to leaderelection.HoldsLease, which is always true without leader election, as in
+	// plugin processes.
+	HoldsLease func() bool
 }
 
 func (s *SyncContext) Close() error {

@@ -137,6 +137,10 @@ func deleteObject(ctx *synccontext.SyncContext, obj client.Object, reason string
 		return err
 	}
 
+	if ctx.HoldsLease != nil && !ctx.HoldsLease() {
+		return fmt.Errorf("refuse to delete %s object %s/%s, because the leader lease could not be confirmed", side, accessor.GetNamespace(), accessor.GetName())
+	}
+
 	if obj.GetNamespace() != "" {
 		ctx.Log.Infof("delete %s %s/%s, because %s", side, accessor.GetNamespace(), accessor.GetName(), reason)
 	} else {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
@@ -21,6 +23,97 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 )
+
+var (
+	leader            atomic.Pointer[leaderState]
+	reportedLeaseLoss atomic.Bool
+	leaseLogLock      sync.Mutex
+)
+
+type leaderState struct {
+	elector       *leaderelection.LeaderElector
+	lock          *renewalRecordingLock
+	renewDeadline time.Duration
+}
+
+// HoldsLease reports whether this replica can trust that it still holds the leader lease: it is the
+// observed holder and its last successful renewal started less than the renew deadline ago. client-go
+// doesn't fence a former leader: a replica that stalls for longer than the lease duration resumes and
+// keeps reconciling until its renew deadline passes, while another replica may already lead. It also
+// turns false when renewals keep failing, up to one retry period before client-go gives the lease up,
+// and for a moment when a renewal takes longer than about half of renewDeadline minus retryPeriod,
+// which only matters when the two are configured close together. Without leader election (a single
+// replica) it always returns true.
+func HoldsLease() bool {
+	holds := holdsLease(leader.Load())
+	if holds != reportedLeaseLoss.Load() {
+		return holds
+	}
+
+	// recompute under the lock, so concurrent callers can't log a transition out of order
+	leaseLogLock.Lock()
+	defer leaseLogLock.Unlock()
+
+	holds = holdsLease(leader.Load())
+	if holds && reportedLeaseLoss.Load() {
+		reportedLeaseLoss.Store(false)
+		klog.Info("Resume reconciling, because the leader lease is confirmed again")
+	} else if !holds && !reportedLeaseLoss.Load() {
+		reportedLeaseLoss.Store(true)
+		klog.Info("Stop reconciling, because the leader lease could not be confirmed")
+	}
+	return holds
+}
+
+func holdsLease(state *leaderState) bool {
+	if state == nil {
+		return true
+	}
+
+	lastRenewal := state.lock.lastRenewal.Load()
+	return state.elector.IsLeader() && lastRenewal != nil && time.Since(*lastRenewal) < state.renewDeadline
+}
+
+func newLeaderState(config leaderelection.LeaderElectionConfig) (*leaderState, error) {
+	lock := &renewalRecordingLock{Interface: config.Lock}
+	config.Lock = lock
+	elector, err := leaderelection.NewLeaderElector(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &leaderState{elector: elector, lock: lock, renewDeadline: config.RenewDeadline}, nil
+}
+
+// renewalRecordingLock records when this replica's last successful acquisition or renewal started.
+// Other replicas date the lease from when they observe that write, which is never earlier. client-go's
+// own observed time moves when the response arrives, and also when the record is merely read before a
+// renewal that then fails.
+type renewalRecordingLock struct {
+	resourcelock.Interface
+
+	lastRenewal atomic.Pointer[time.Time]
+}
+
+func (l *renewalRecordingLock) Create(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	return l.recordWrite(record, func() error { return l.Interface.Create(ctx, record) })
+}
+
+func (l *renewalRecordingLock) Update(ctx context.Context, record resourcelock.LeaderElectionRecord) error {
+	return l.recordWrite(record, func() error { return l.Interface.Update(ctx, record) })
+}
+
+func (l *renewalRecordingLock) recordWrite(record resourcelock.LeaderElectionRecord, write func() error) error {
+	start := time.Now()
+	if err := write(); err != nil {
+		return err
+	}
+
+	if record.HolderIdentity == l.Identity() {
+		l.lastRenewal.Store(&start)
+	}
+	return nil
+}
 
 func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Scheme, run func() error) error {
 	localConfig := ctx.HostManager.GetConfig()
@@ -64,7 +157,7 @@ func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Sch
 	}
 
 	// try and become the leader and start controller manager loops
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+	state, err := newLeaderState(leaderelection.LeaderElectionConfig{
 		Lock:          rl,
 		LeaseDuration: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.LeaseDuration) * time.Second,
 		RenewDeadline: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.RenewDeadline) * time.Second,
@@ -91,6 +184,12 @@ func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Sch
 			},
 		},
 	})
+	if err != nil {
+		return errors.Wrap(err, "create leader elector")
+	}
+
+	leader.Store(state)
+	state.elector.Run(ctx)
 
 	return nil
 }
