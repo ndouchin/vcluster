@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 var (
 	leader            atomic.Pointer[leaderState]
 	reportedLeaseLoss atomic.Bool
+	leaseLogLock      sync.Mutex
 )
 
 type leaderState struct {
@@ -41,17 +43,24 @@ type leaderState struct {
 // turns false when renewals keep failing, up to one retry period before client-go gives the lease up.
 // Without leader election (a single replica) it always returns true.
 func HoldsLease() bool {
-	if holdsLease(leader.Load()) {
-		if reportedLeaseLoss.CompareAndSwap(true, false) {
-			klog.Info("Resume reconciling, because the leader lease is confirmed again")
-		}
-		return true
+	holds := holdsLease(leader.Load())
+	if holds != reportedLeaseLoss.Load() {
+		return holds
 	}
 
-	if reportedLeaseLoss.CompareAndSwap(false, true) {
+	// recompute under the lock, so concurrent callers can't log a transition out of order
+	leaseLogLock.Lock()
+	defer leaseLogLock.Unlock()
+
+	holds = holdsLease(leader.Load())
+	if holds && reportedLeaseLoss.Load() {
+		reportedLeaseLoss.Store(false)
+		klog.Info("Resume reconciling, because the leader lease is confirmed again")
+	} else if !holds && !reportedLeaseLoss.Load() {
+		reportedLeaseLoss.Store(true)
 		klog.Info("Stop reconciling, because the leader lease could not be confirmed")
 	}
-	return false
+	return holds
 }
 
 func holdsLease(state *leaderState) bool {
