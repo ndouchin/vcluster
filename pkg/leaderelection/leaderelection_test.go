@@ -79,7 +79,10 @@ func TestHoldsLease(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("replica did not acquire the lease")
 	}
-	assert.Assert(t, holdsLease(state), "a leader that renews its lease holds it")
+	assert.Assert(t, holdsLease(state), "a leader that just acquired its lease holds it")
+
+	time.Sleep(1200 * time.Millisecond)
+	assert.Assert(t, holdsLease(state), "a leader that keeps renewing past the renew deadline still holds its lease")
 
 	// a renewal stuck for longer than the lease duration stands in for a paused process
 	updates.Store(stallUpdates)
